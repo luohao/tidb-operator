@@ -197,6 +197,8 @@ func (c *PodController) sync(key string) (reconcile.Result, error) {
 	component := pod.Labels[label.ComponentLabelKey]
 	ctx := context.Background()
 	switch component {
+	case label.PDLabelVal:
+		return c.syncPDPod(ctx, pod, tc)
 	case label.TiKVLabelVal:
 		return c.syncTiKVPod(ctx, pod, tc)
 	default:
@@ -211,6 +213,78 @@ func (c *PodController) getPDClient(tc *v1alpha1.TidbCluster) pdapi.PDClient {
 
 	pdClient := controller.GetPDClient(c.deps.PDControl, tc)
 	return pdClient
+}
+
+func (c *PodController) syncPDPod(ctx context.Context, pod *corev1.Pod, tc *v1alpha1.TidbCluster) (reconcile.Result, error) {
+	if _, ok := pod.Annotations[v1alpha1.RestartPodAnnKey]; !ok {
+		// no restart annotation set, we can skip this PD Pod
+		return reconcile.Result{}, nil
+	}
+
+	// checks if it's safe to delete this PD pod
+	// TODO: handle SuspendPhase
+	safeToEvict := c.isPDInQuorum(tc) && tc.Status.PD.Phase == v1alpha1.NormalPhase
+
+	if !safeToEvict {
+		// we need to check later
+		klog.Warningf("not safe to evict PD pod %s/%s at this moment, will check back later", pod.Namespace, pod.Name)
+		return reconcile.Result{Requeue: true}, nil
+	}
+	// delete the Pod
+	klog.Infof("evicting PD pod %s/%s", pod.Namespace, pod.Name)
+	if err := c.deletePDPod(ctx, pod, tc); err != nil {
+		klog.Warningf("failed to evict PD pod %s/%s: %v", pod.Namespace, pod.Name, err)
+		return reconcile.Result{}, err
+	}
+	klog.Infof("done evicting PD pod %s/%s", pod.Namespace, pod.Name)
+	return reconcile.Result{}, nil
+}
+
+// isPDInQuorum checks if PD has enough Pod after eviction
+func (c *PodController) isPDInQuorum(tc *v1alpha1.TidbCluster) bool {
+	healthCount := 0
+	for _, pdMember := range tc.Status.PD.Members {
+		if pdMember.Health {
+			healthCount++
+		}
+	}
+	for _, pdMember := range tc.Status.PD.PeerMembers {
+		if pdMember.Health {
+			healthCount++
+		}
+	}
+	return healthCount > (len(tc.Status.PD.Members)+len(tc.Status.PD.PeerMembers))/2+1
+}
+
+func (c *PodController) deletePDPod(ctx context.Context, pod *corev1.Pod, tc *v1alpha1.TidbCluster) error {
+	pdClient := c.getPDClient(tc)
+	leader, err := pdClient.GetPDLeader()
+	if err != nil {
+		klog.Warningf("failed to get PD leader: %v", err)
+		return err
+	}
+	// transfer leader to another Pod before we delete the Pod
+	if leader.Name == pod.Name {
+		var newLeader string
+		for _, pdMember := range tc.Status.PD.Members {
+			if pdMember.Health && pdMember.Name != leader.Name {
+				newLeader = pdMember.Name
+				break
+			}
+		}
+		if err = pdClient.TransferPDLeader(newLeader); err != nil {
+			klog.Warningf("failed to transfer PD leader to %v: %v", newLeader, err)
+			return err
+		}
+	}
+
+	// now it's safe to delete the PD Pod
+	if err = c.deps.KubeClientset.CoreV1().Pods(pod.Namespace).Delete(ctx, pod.Name, metav1.DeleteOptions{}); err != nil {
+		klog.Warningf("failed to delete PD Pod %v/%v: %v", pod.Namespace, pod.Name, err)
+		return err
+	}
+
+	return nil
 }
 
 func (c *PodController) syncTiKVPod(ctx context.Context, pod *corev1.Pod, tc *v1alpha1.TidbCluster) (reconcile.Result, error) {
