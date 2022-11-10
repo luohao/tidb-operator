@@ -269,7 +269,57 @@ func (m *pdMemberManager) syncPDStatefulSetForTidbCluster(tc *v1alpha1.TidbClust
 		}
 	}
 
+	if tc.Status.PD.Phase == v1alpha1.NormalPhase {
+		if err := m.handleRestarts(tc); err != nil {
+			return err
+		}
+	}
 	return mngerutils.UpdateStatefulSetWithPrecheck(m.deps, tc, "FailedUpdatePDSTS", newPDSet, oldPDSet)
+}
+
+// hasQuorum checks if PD has enough Pod after eviction
+func (m *pdMemberManager) hasQuorum(tc *v1alpha1.TidbCluster) bool {
+	healthCount := 0
+	for _, pdMember := range tc.Status.PD.Members {
+		if pdMember.Health {
+			healthCount++
+		}
+	}
+	for _, pdMember := range tc.Status.PD.PeerMembers {
+		if pdMember.Health {
+			healthCount++
+		}
+	}
+	return healthCount > (len(tc.Status.PD.Members)+len(tc.Status.PD.PeerMembers))/2+1
+}
+
+func (m *pdMemberManager) handleRestarts(tc *v1alpha1.TidbCluster) error {
+	if !m.hasQuorum(tc) {
+		// we can't restart any Pod if PD doesn't have enough members to form quorum
+		return nil
+	}
+	if len(tc.Status.PD.PendingRestarts) == 0 {
+		// nothing needs to be restarted
+		return nil
+	}
+
+	// restart Pod
+	victim := tc.Status.PD.PendingRestarts[0]
+	pod, err := m.deps.PodLister.Pods(victim.Namespace).Get(victim.Name)
+	if err != nil {
+		return err
+	}
+	if _, exist := pod.Annotations[v1alpha1.RestartPodAnnKey]; exist {
+		// Pod needs restart
+		if err = m.deps.PodControl.DeletePod(tc, pod); err != nil {
+			return err
+		}
+	}
+
+	// remove it from pending restart list
+	tc.Status.PD.PendingRestarts = tc.Status.PD.PendingRestarts[1:]
+
+	return nil
 }
 
 // shouldRecover checks whether we should perform recovery operation.

@@ -1220,6 +1220,9 @@ type PDStatus struct {
 	// +optional
 	// +nullable
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
+
+	// PendingRestarts is an array of Pod names that needs to be restarted
+	PendingRestarts []types.NamespacedName
 }
 
 // PDMember is PD member
@@ -1304,6 +1307,9 @@ const (
 	EvictLeaderAnnKey = "tidb.pingcap.com/evict-leader"
 	// EvictLeaderAnnKeyForResize is the annotation key to evict leader user by pvc resizer.
 	EvictLeaderAnnKeyForResize = "tidb.pingcap.com/evict-leader-for-resize"
+
+	// RestartPodAnnKey is the annotation key to restart a Pod in TiDB cluster
+	RestartPodAnnKey = "tidb.pingcap.com/restart"
 )
 
 // The `Value` of annotation controls the behavior when the leader count drops to zero, the valid value is one of:

@@ -16,6 +16,7 @@ package tidbcluster
 import (
 	"context"
 	"fmt"
+	"k8s.io/apimachinery/pkg/types"
 	"sync"
 	"time"
 
@@ -211,6 +212,23 @@ func (c *PodController) getPDClient(tc *v1alpha1.TidbCluster) pdapi.PDClient {
 
 	pdClient := controller.GetPDClient(c.deps.PDControl, tc)
 	return pdClient
+}
+
+func (c *PodController) syncPDPod(ctx context.Context, pod *corev1.Pod, tc *v1alpha1.TidbCluster) (reconcile.Result, error) {
+	if _, ok := pod.Annotations[v1alpha1.RestartPodAnnKey]; !ok {
+		// no restart annotation set, we can skip this PD Pod
+		return reconcile.Result{}, nil
+	}
+	// add Pod to tc.Status.PD.PendingRestarts
+	var err error
+	name := types.NamespacedName{Namespace: pod.Namespace, Name: pod.Name}
+	tc.Status.PD.PendingRestarts = append(tc.Status.PD.PendingRestarts, name)
+	tc, err = c.deps.Clientset.PingcapV1alpha1().TidbClusters(tc.Namespace).Update(ctx, tc, metav1.UpdateOptions{})
+	if err != nil {
+		return reconcile.Result{}, perrors.Annotatef(err, "failed to add Pod %v to pending restart lists", name)
+	}
+
+	return reconcile.Result{}, nil
 }
 
 func (c *PodController) syncTiKVPod(ctx context.Context, pod *corev1.Pod, tc *v1alpha1.TidbCluster) (reconcile.Result, error) {
